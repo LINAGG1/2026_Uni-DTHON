@@ -7,6 +7,7 @@ import pandas as pd
 
 
 LABELS = np.arange(1, 7)
+MODEL_INDEX_FORMAT = "uni_d_ensemble_v1"
 REFERENCE_SENSORS = (
     "meas_v", "meas_a", "meas_t1", "meas_t2", "thermal_t", "meas_p",
     "meas_co", "meas_co2", "meas_hf",
