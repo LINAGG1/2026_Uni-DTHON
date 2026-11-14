@@ -1,144 +1,164 @@
-"""Uni-D 배터리 열폭주 6단계 분류 — 베이스라인 v7 공통 모듈.
+"""Feature preparation and probability combination for the Uni-D submission."""
 
-센서 5개 + 열화상 이미지 통계 + 과거 방향(인과) 시계열 피처 + 로지스틱 회귀.
-train.py, test.py, 베이스라인 노트북이 모두 이 모듈과 같은 코드를 사용합니다.
-"""
-from __future__ import annotations
-
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
-from PIL import Image
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
-SEED = 42
-LABELS = list(range(1, 7))
-SENSORS = ['meas_v', 'meas_a', 'meas_t1', 'meas_t2', 'meas_p']
-IMAGE_STATS = ['img_mean', 'img_std', 'img_max', 'img_p95', 'img_p99', 'img_hot_ratio']
-# 시계열 피처를 만들 신호: 센서 5개 + 이미지 고온 통계 2개
-WINDOW_SIGNALS = SENSORS + ['img_max', 'img_p99']
-WINDOW_S = 30.0          # 과거 윈도우 길이(초). 행 수가 아니라 relative_time_s 기준입니다.
-HOT_THRESHOLD = 0.8      # 밝기 0~1 기준 고온 픽셀 임계값(고정값, 데이터로 학습하지 않음)
 
 
-# ---------------------------------------------------------------------------
-# 1. 이미지 경로 연결
-# ---------------------------------------------------------------------------
-def resolve_image_paths(frame: pd.DataFrame, roots: list[Path]) -> pd.Series:
-    """CSV의 image_path를 실제 파일 경로로 바꿉니다.
-
-    roots를 순서대로 기준 폴더로 시도하고, 모두 실패하면 파일명으로 찾습니다.
-    """
-    rel = frame['image_path'].astype(str)
-    for root in roots:
-        candidate = rel.map(lambda p: Path(root) / p)
-        if candidate.map(Path.is_file).all():
-            return candidate
-    # 경로 규칙이 맞지 않으면 파일명 기준으로 검색합니다.
-    index = {}
-    for root in roots:
-        for path in Path(root).rglob('*'):
-            if path.is_file():
-                index.setdefault(path.name, path)
-    candidate = rel.map(lambda p: index.get(Path(p).name))
-    missing = candidate.isna().sum()
-    assert missing == 0, f'이미지 {missing}개를 찾지 못했습니다. image_root를 확인하십시오. 예: {rel[candidate.isna()].iloc[0]}'
-    return candidate
+LABELS = np.arange(1, 7)
+REFERENCE_SENSORS = (
+    "meas_v", "meas_a", "meas_t1", "meas_t2", "thermal_t", "meas_p",
+    "meas_co", "meas_co2", "meas_hf",
+)
+CATEGORICAL_COLUMNS = {"bat_class", "bat_cc", "soc_status", "tr_method"}
 
 
-# ---------------------------------------------------------------------------
-# 2. 이미지 통계 피처 (샘플마다 독립 계산 → 다른 행 정보 사용 없음)
-# ---------------------------------------------------------------------------
-def _image_stats(path) -> list[float]:
-    with Image.open(path) as img:
-        arr = np.asarray(img.convert('L'), dtype=np.float32) / 255.0
-    return [
-        float(arr.mean()),
-        float(arr.std()),
-        float(arr.max()),
-        float(np.percentile(arr, 95)),
-        float(np.percentile(arr, 99)),
-        float((arr >= HOT_THRESHOLD).mean()),
+def build_submission_features(frame, image_root, *, raw_v34=False):
+    """Build each branch's inputs from the requested rows and their images."""
+    from feature_sources import event_history
+    from feature_sources.rgb13 import model as rgb_model
+    from feature_sources.v34 import model as common_model
+    from feature_sources.v34.sensor_features_v34 import build_sensor_features_v34
+
+    frame = frame.reset_index(drop=True)
+    roots = [image_root]
+    if image_root.parent != image_root:
+        roots.append(image_root.parent)
+    rgb_paths = rgb_model.resolve_image_paths(frame, roots)
+    rgb_images = rgb_model.extract_image_features(frame, rgb_paths)
+    rgb = rgb_model.build_features(frame, rgb_images)
+    if rgb.index.name == "sample_id" and not np.array_equal(rgb.index, frame["sample_id"]):
+        raise ValueError("13차 특징의 sample_id 순서가 다릅니다.")
+
+    common_paths = common_model.resolve_image_paths(frame, roots)
+    if raw_v34:
+        images = common_model.extract_image_features(frame, common_paths)
+    else:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            values = list(pool.map(common_model._image_stats, common_paths))
+        images = pd.DataFrame(
+            values, columns=common_model.IMAGE_STATS,
+            index=pd.Index(frame["sample_id"].values, name="sample_id"),
+        )
+    base = common_model.build_features(frame, images).reset_index(drop=True)
+    extra = build_sensor_features_v34(frame).reset_index(drop=True)
+    common = pd.concat(
+        [base, extra.drop(columns=base.columns.intersection(extra.columns))], axis=1
+    )
+    if not raw_v34:
+        common = prepare_common_features(common)
+    events = event_history.event_features(frame)
+    if rgb.shape != (len(frame), 49) or common.shape != (len(frame), 176):
+        raise ValueError(f"13차 / 34차 특징 크기 확인 필요: {rgb.shape} / {common.shape}")
+    return rgb, common, events
+
+
+def prepare_common_features(common):
+    """Use the sentinel expected by the other branches sharing v34 features."""
+    return common.replace([np.inf, -np.inf], np.nan).fillna(-999)
+
+
+def make_lightgbm_features(frame, v34_features):
+    """Add the 27 reference features used by the saved leaves15 models."""
+    if len(frame) != len(v34_features):
+        raise ValueError("CSV 행과 34차 특징의 행 수가 다릅니다.")
+    signals = {
+        name: pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=float)
+        for name in REFERENCE_SENSORS
+    }
+    reference = {
+        f"reference_{name}_{stat}": np.full(len(frame), np.nan)
+        for name in REFERENCE_SENSORS
+        for stat in ("initial_delta", "past_min_delta", "past_max_delta")
+    }
+    time = frame["relative_time_s"].to_numpy()
+    for positions in frame.groupby("experiment_id", sort=False).indices.values():
+        positions = positions[np.argsort(time[positions], kind="stable")]
+        for name, signal in signals.items():
+            values = signal[positions]
+            series = pd.Series(values)
+            reference[f"reference_{name}_initial_delta"][positions] = values - values[0]
+            reference[f"reference_{name}_past_min_delta"][positions] = (
+                values - series.cummin().to_numpy()
+            )
+            reference[f"reference_{name}_past_max_delta"][positions] = (
+                values - series.cummax().to_numpy()
+            )
+    base = v34_features.reset_index(drop=True).replace(-999, np.nan)
+    return pd.concat([base, pd.DataFrame(reference)], axis=1)
+
+
+def predict_lightgbm(model, features):
+    """Apply the saved feature order and category encoding for one fold."""
+    columns = model.feature_name_
+    categories = [name for name in columns if name in CATEGORICAL_COLUMNS]
+    levels = model.booster_.pandas_categorical
+    if levels is None or len(categories) != len(levels):
+        raise ValueError("LightGBM 가중치에 저장된 범주 인코딩을 확인하세요.")
+    if not np.array_equal(model.classes_, LABELS):
+        raise ValueError("LightGBM 클래스 순서가 1~6과 다릅니다.")
+
+    X = features.loc[:, columns].copy()
+    for name, values in zip(categories, levels):
+        X[name] = pd.Categorical(X[name], categories=values)
+    return model.predict_proba(X)
+
+
+def make_extratrees_features(v34_features, event_features, lightgbm_model):
+    """Apply the category coding and numeric conversion used for ExtraTrees."""
+    base = v34_features.reset_index(drop=True).replace(-999, np.nan)
+    events = event_features.reset_index(drop=True).add_prefix("event_")
+    if len(base) != len(events):
+        raise ValueError("34차 특징과 이력 특징의 행 수가 다릅니다.")
+    X = pd.concat([base, events], axis=1)
+    if not X.columns.is_unique or X.shape[1] != 797:
+        raise ValueError(f"ExtraTrees 입력 특징 확인 필요: {X.shape[1]}개")
+    categories = [
+        name for name in lightgbm_model.feature_name_ if name in CATEGORICAL_COLUMNS
     ]
+    levels = lightgbm_model.booster_.pandas_categorical
+    if levels is None or len(categories) != len(levels):
+        raise ValueError("가중치에 저장된 범주 인코딩을 확인하세요.")
+    for name, values in zip(categories, levels):
+        X[name] = pd.Categorical(X[name], categories=values).codes.astype(float)
+    return X.fillna(-999).astype(np.float32)
 
 
-def extract_image_features(frame: pd.DataFrame, paths: pd.Series, n_jobs: int = -1) -> pd.DataFrame:
-    """sample_id를 인덱스로 하는 이미지 통계 표를 만듭니다."""
-    rows = Parallel(n_jobs=n_jobs, batch_size=64)(delayed(_image_stats)(p) for p in paths)
-    return pd.DataFrame(rows, columns=IMAGE_STATS, index=pd.Index(frame['sample_id'].values, name='sample_id'))
+def redistribute(probabilities, labels, conditional, strength):
+    """Change the distribution within the given classes, keeping their total."""
+    selected = np.asarray(labels, dtype=int) - 1
+    adjusted = probabilities.copy()
+    mass = adjusted[:, selected].sum(axis=1, keepdims=True)
+    original = adjusted[:, selected] / np.maximum(mass, 1e-12)
+    adjusted[:, selected] = mass * (
+        (1 - strength) * original + strength * conditional
+    )
+    return adjusted
 
 
-# ---------------------------------------------------------------------------
-# 3. 과거 방향 시계열 피처
-#    같은 experiment_id 안에서 relative_time_s <= 현재 시점인 관측만 사용합니다.
-#    실험 전체 통계(평균·최댓값·길이·순위 등)는 사용하지 않습니다.
-# ---------------------------------------------------------------------------
-def _causal_one_experiment(t: np.ndarray, x: np.ndarray, window_s: float):
-    """한 실험(시간순 정렬)에 대해 행마다 (t-window, t] 평균·최댓값과 window 이전 값과의 차이를 계산합니다."""
-    n = len(t)
-    mean = np.full(n, np.nan)
-    vmax = np.full(n, np.nan)
-    delta = np.full(n, np.nan)
-    start = np.searchsorted(t, t - window_s, side='right')   # 윈도우 시작 위치
-    end = np.searchsorted(t, t, side='right')                 # 같은 시각 관측까지 포함(<= t)
-    lag = np.searchsorted(t, t - window_s, side='right') - 1  # t-window 이하의 마지막 관측
-    for i in range(n):
-        w = x[start[i]:end[i]]
-        w = w[~np.isnan(w)]
-        if len(w):
-            mean[i] = w.mean()
-            vmax[i] = w.max()
-        if lag[i] >= 0:
-            delta[i] = x[i] - x[lag[i]]
-    return mean, vmax, delta
+def combine_probabilities(v34, stage23_p3, rgb13, leaves15, expert456):
+    """Combine aligned rows, with class columns in ascending label order."""
+    n_rows = len(v34)
+    expected_shapes = (
+        ("v34", v34, (n_rows, 6)),
+        ("stage23_p3", stage23_p3, (n_rows,)),
+        ("rgb13", rgb13, (n_rows, 6)),
+        ("leaves15", leaves15, (n_rows, 6)),
+        ("expert456", expert456, (n_rows, 3)),
+    )
+    for name, values, shape in expected_shapes:
+        if values.shape != shape or not np.isfinite(values).all():
+            raise ValueError(f"{name}: expected finite probabilities with shape {shape}")
 
-
-def add_causal_features(base: pd.DataFrame, signals: list[str], window_s: float = WINDOW_S) -> pd.DataFrame:
-    """실험마다 따로 계산하므로 다른 실험·미래 관측이 입력에 있든 없든 결과가 같습니다."""
-    w = int(window_s)
-    cols = [f'{s}_{k}{w}s' for s in signals for k in ('mean', 'max', 'delta')]
-    out = pd.DataFrame(np.nan, index=base.index, columns=cols)
-    times = base['relative_time_s'].to_numpy(dtype=float)
-    for _, idx in base.groupby('experiment_id', sort=False).indices.items():
-        idx = idx[np.argsort(times[idx], kind='mergesort')]
-        t = times[idx]
-        for s in signals:
-            m, mx, d = _causal_one_experiment(t, base[s].to_numpy(dtype=float)[idx], window_s)
-            out.iloc[idx, out.columns.get_loc(f'{s}_mean{w}s')] = m
-            out.iloc[idx, out.columns.get_loc(f'{s}_max{w}s')] = mx
-            out.iloc[idx, out.columns.get_loc(f'{s}_delta{w}s')] = d
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 4. 전체 피처 조립
-# ---------------------------------------------------------------------------
-def numeric(frame: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    return frame[cols].apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan)
-
-
-def build_features(frame: pd.DataFrame, image_features: pd.DataFrame) -> pd.DataFrame:
-    """frame에 들어 있는 행만으로 피처를 만듭니다. 다른 split·다른 실험의 행은 쓰지 않습니다."""
-    base = frame[['sample_id', 'experiment_id']].copy()
-    base['relative_time_s'] = pd.to_numeric(frame['relative_time_s'], errors='coerce')
-    base[SENSORS] = numeric(frame, SENSORS)
-    img = image_features.reindex(frame['sample_id'].values)
-    assert img.notna().all(axis=1).all(), '이미지 피처가 없는 샘플이 있습니다.'
-    base[IMAGE_STATS] = img.values
-    causal = add_causal_features(base, WINDOW_SIGNALS)
-    return pd.concat([base[['relative_time_s'] + SENSORS + IMAGE_STATS], causal], axis=1)
-
-
-def build_model(class_weight=None) -> Pipeline:
-    return Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler()),
-        ('classifier', LogisticRegression(
-            C=1.0, solver='lbfgs', max_iter=3000, class_weight=class_weight, random_state=SEED,
-        )),
-    ])
+    # Match submit_stage23.py: its conditional class 3 score is complemented
+    # after interpolation to obtain the class 2 score.
+    stage23 = v34.copy()
+    mass23 = stage23[:, 1] + stage23[:, 2]
+    original_p3 = stage23[:, 2] / np.maximum(mass23, 1e-12)
+    adjusted_p3 = 0.25 * original_p3 + 0.75 * stage23_p3
+    stage23[:, 1] = mass23 * (1 - adjusted_p3)
+    stage23[:, 2] = mass23 * adjusted_p3
+    stage23_b = 0.50 * stage23 + 0.50 * rgb13
+    base = 0.90 * stage23_b + 0.10 * leaves15
+    return redistribute(base, (4, 5, 6), expert456, strength=0.75)
