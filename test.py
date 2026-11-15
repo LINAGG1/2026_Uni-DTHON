@@ -10,6 +10,74 @@ import pandas as pd
 from catboost import CatBoostClassifier
 
 import model as M
+from sensor_features_v3 import build_sensor_features_v3
+
+
+class SensorCNN(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, 64, 5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, 5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(128, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Dropout(0.25),
+            nn.Linear(128, 6),
+        )
+
+    def forward(self, x):
+        return self.net(x.transpose(1, 2))
+
+
+def make_sequences(frame, bundle):
+    sensors = bundle["sensors"]
+    seq_len = bundle["seq_len"]
+    window = bundle["window_seconds"]
+
+    values = (
+        frame[sensors]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
+        .to_numpy(dtype=np.float64)
+    )
+    values = np.clip(bundle["scaler"].transform(values), -10, 10)
+
+    times = pd.to_numeric(
+        frame["relative_time_s"], errors="coerce"
+    ).to_numpy(dtype=np.float64)
+
+    result = np.zeros(
+        (len(frame), seq_len, len(sensors) + 1),
+        dtype=np.float32,
+    )
+
+    for indices in frame.groupby(
+        "experiment_id", sort=False
+    ).indices.values():
+        indices = np.asarray(indices)
+        idx = indices[np.argsort(times[indices], kind="stable")]
+        t = times[idx]
+
+        for j, row_idx in enumerate(idx):
+            start = np.searchsorted(
+                t, t[j] - window, side="left"
+            )
+            start = max(start, j - seq_len + 1)
+            history = idx[start:j + 1]
+            n = len(history)
+
+            result[row_idx, -n:, :-1] = values[history]
+            result[row_idx, -n:, -1] = 1.0
+
+    return result
 
 
 DEFAULT_WEIGHTS = Path(__file__).resolve().parent / "weights"
