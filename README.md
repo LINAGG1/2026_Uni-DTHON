@@ -42,7 +42,7 @@ python test.py --input /home/ubuntu/data/battery_data_light/test/test.csv \
 
 - 학습 데이터: 공식 Train만 사용
 - 검증 방법: Train에서 experiment_id 기준 GroupKFold(5)로 생성한 OOF 예측으로 조합을 비교하고, 공식 Validation에서 별도로 성능을 확인했습니다.
-- 검증 점수: Train OOF Macro F1은 0.903963입니다.
+- 검증 점수: Validation Macro F1은 0.7675830222
 
 ## 시계열 피처 구성
 
